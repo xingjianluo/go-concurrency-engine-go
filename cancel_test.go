@@ -21,9 +21,13 @@ func TestCancelMidflight(t *testing.T) {
 	e.Start()
 
 	var longStarted int64
-	results := make(chan Result, nLong+nQueued)
-	errs := make(chan error, nLong+nQueued)
-	var submitErr, submitOK int64
+	// result/err 必须成对送达同一通道，避免两个独立通道在多 goroutine 下
+	// 被交错接收、错配成“零值 result + nil err”这种说不清的组合。
+	type outcome struct {
+		r   Result
+		err error
+	}
+	outcomes := make(chan outcome, nLong+nQueued)
 
 	// 长任务尊重 ctx：阻塞直到取消或完成。
 	for i := 0; i < nLong; i++ {
@@ -34,8 +38,7 @@ func TestCancelMidflight(t *testing.T) {
 				<-ctx.Done()
 				return ctx.Err()
 			}})
-			results <- r
-			errs <- err
+			outcomes <- outcome{r, err}
 		}()
 	}
 	// 等待长任务占满两个工作协程。
@@ -48,15 +51,7 @@ func TestCancelMidflight(t *testing.T) {
 		i := i
 		go func() {
 			r, err := e.Submit(context.Background(), quickTask(fmt.Sprintf("q%d", i), 5*time.Second, nil))
-			if err != nil {
-				atomic.AddInt64(&submitErr, 1)
-				results <- Result{}
-				errs <- err
-				return
-			}
-			atomic.AddInt64(&submitOK, 1)
-			results <- r
-			errs <- nil
+			outcomes <- outcome{r, err}
 		}()
 	}
 	// 尽量等待队列被填满，证明存在在途任务（慢机器下允许未填满即取消）。
@@ -75,8 +70,8 @@ func TestCancelMidflight(t *testing.T) {
 	gotRejected := 0
 	total := nLong + nQueued
 	for i := 0; i < total; i++ {
-		r := <-results
-		err := <-errs
+		oc := <-outcomes
+		r, err := oc.r, oc.err
 		switch {
 		case err == nil && r.Class == ClassCanceled:
 			gotCanceled++
