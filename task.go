@@ -37,15 +37,19 @@ func (c FailureClass) String() string {
 }
 
 // Task 是引擎调度的最小工作单元。ID 用于幂等去重，Fn 承载实际工作。
+// Group 标识任务来源（分组）：同一 Group 的任务共享该组的并发额度，
+// 参与跨组的公平调度；空串表示默认分组（旧用法不变）。
 type Task struct {
-	ID string
-	Fn func(ctx context.Context) error
+	ID    string
+	Group string
+	Fn    func(ctx context.Context) error
 }
 
 // Result 是一个任务（按 ID 幂等去重后）的最终裁决结果。
 // 对同一 ID 的并发/重复投递，所有提交方拿到同一个 Result，且只统计一次。
 type Result struct {
 	TaskID   string
+	Group    string // 任务所属分组（受理时确定，去重共享时与首次投递一致）
 	Class    FailureClass
 	Attempts int           // 实际尝试次数（含首次）；重试耗尽时等于 MaxAttempts
 	Duration time.Duration // 从首次执行开始至终态裁决的总耗时（含退避等待）

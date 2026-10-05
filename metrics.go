@@ -36,18 +36,30 @@ type Metrics struct {
 // aggregator 聚合终态结果。所有方法并发安全；引擎内部仅有单一消费者调用
 // recordResult，但 Snapshot/Results 可能被外部任意 goroutine 读取。
 type aggregator struct {
-	mu   sync.Mutex
-	m    Metrics
-	done []Result
+	mu     sync.Mutex
+	m      Metrics
+	groups map[string]*GroupMetrics // 按分组的受理/终态计数，与全局同口径累加
+	done   []Result
 }
 
 func newAggregator() *aggregator {
-	return &aggregator{}
+	return &aggregator{groups: make(map[string]*GroupMetrics)}
 }
 
-func (a *aggregator) addSubmitted(delta int64) {
+// groupLocked 返回指定分组的计数桶，不存在则创建。
+func (a *aggregator) groupLocked(name string) *GroupMetrics {
+	g, ok := a.groups[name]
+	if !ok {
+		g = &GroupMetrics{}
+		a.groups[name] = g
+	}
+	return g
+}
+
+func (a *aggregator) addSubmitted(group string, delta int64) {
 	a.mu.Lock()
 	a.m.Submitted += delta
+	a.groupLocked(group).Submitted += delta
 	a.mu.Unlock()
 }
 
@@ -64,21 +76,27 @@ func (a *aggregator) addBackpressure(wait time.Duration) {
 	a.mu.Unlock()
 }
 
-// recordResult 按终态类别累加计数；同一 Result 只会被传入一次（见引擎的
-// 单消费者），因此重试不会导致同一任务结果被重复累计。
+// recordResult 按终态类别累加计数（全局与所属分组同口径各记一笔）；
+// 同一 Result 只会被传入一次（见引擎的单消费者），因此重试不会导致
+// 同一任务结果被重复累计。
 func (a *aggregator) recordResult(r Result) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	g := a.groupLocked(r.Group)
 	switch r.Class {
 	case ClassSuccess:
 		a.m.Succeeded++
+		g.Succeeded++
 	case ClassPermanent:
 		a.m.PermanentFailures++
+		g.PermanentFailures++
 	case ClassTemporary:
 		// 临时失败走到终态只有一种情况：重试耗尽。
 		a.m.RetryExhausted++
+		g.RetryExhausted++
 	case ClassCanceled:
 		a.m.Canceled++
+		g.Canceled++
 	}
 	if r.Attempts > 0 {
 		a.m.Attempts += int64(r.Attempts)
@@ -94,6 +112,28 @@ func (a *aggregator) snapshot() Metrics {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.m
+}
+
+// groupSnapshot 返回单个分组的计数快照。
+func (a *aggregator) groupSnapshot(name string) (GroupMetrics, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	g, ok := a.groups[name]
+	if !ok {
+		return GroupMetrics{}, false
+	}
+	return *g, true
+}
+
+// groupSnapshots 返回全部分组计数快照的副本。
+func (a *aggregator) groupSnapshots() map[string]GroupMetrics {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make(map[string]GroupMetrics, len(a.groups))
+	for name, g := range a.groups {
+		out[name] = *g
+	}
+	return out
 }
 
 // results 返回已记录结果的副本；按完成顺序排列，但计数汇总与顺序无关。
