@@ -16,10 +16,11 @@ import (
 func main() {
 	ctx := context.Background()
 	e := engine.New(engine.Config{
-		Workers:     4, // 受控并发度
+		Workers:     4, // 受控并发度（全局上限）
 		QueueSize:   8, // 有界缓冲：满则背压
 		Retry:       engine.DefaultRetryPolicy(),
 		Deduplicate: true, // 相同 ID 幂等
+		GroupLimits: map[string]int{"source-a": 1}, // 分组额度：source-a 同时在跑 ≤1
 	})
 	e.Start()
 
@@ -45,6 +46,37 @@ func main() {
 		go func() { _, _ = e.Submit(ctx, flaky) }()
 	}
 	time.Sleep(20 * time.Millisecond)
+
+	// 3.5) 分组隔离：source-a 持续猛灌（组内限流 1），source-b 照常拿到
+	// 执行机会；随后单独取消 source-a，source-b 不受影响。
+	for i := range 6 {
+		go func() {
+			_, _ = e.Submit(ctx, engine.Task{
+				ID:    fmt.Sprintf("a-%d", i),
+				Group: "source-a",
+				Fn: func(ctx context.Context) error {
+					time.Sleep(30 * time.Millisecond)
+					return nil
+				},
+			})
+		}()
+	}
+	for i := range 3 {
+		go func() {
+			_, _ = e.Submit(ctx, engine.Task{
+				ID:    fmt.Sprintf("b-%d", i),
+				Group: "source-b",
+				Fn:    func(context.Context) error { return nil },
+			})
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	e.CancelGroup("source-a") // 只停 source-a：在途取消、排队裁决、后续拒绝
+	if _, err := e.Submit(ctx, engine.Task{ID: "a-late", Group: "source-a", Fn: func(context.Context) error { return nil }}); err != nil {
+		fmt.Printf("group-cancel=> 向 source-a 提交 err=%v（符合预期）\n", err)
+	}
+	gs := e.GroupSnapshots()
+	fmt.Printf("groups      => source-a=%+v source-b=%+v\n", gs["source-a"], gs["source-b"])
 
 	// 4) 取消：启动一个长任务后取消引擎。
 	go func() {
